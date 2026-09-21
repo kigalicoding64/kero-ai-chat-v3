@@ -1,10 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useServerFn } from "@tanstack/react-start";
-import { ArrowUp, RefreshCw, Square, TriangleAlert } from "lucide-react";
+import { ArrowUp, Mic, RefreshCw, Square, TriangleAlert } from "lucide-react";
 import { toast } from "sonner";
 
 import { Markdown } from "./Markdown";
 import { KeroMark } from "./KeroMark";
+import { AudioNoteRecorder } from "./AudioNoteRecorder";
+import { LiveVoiceModal } from "./LiveVoiceModal";
+import { ReadAloudButton } from "./ReadAloudButton";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { supabase } from "@/integrations/supabase/client";
@@ -42,6 +45,7 @@ export function ChatView({
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
   const [pending, setPending] = useState(false);
+  const [voiceModalOpen, setVoiceModalOpen] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
@@ -294,7 +298,12 @@ export function ChatView({
                       {message.content}
                     </p>
                   ) : message.content ? (
-                    <Markdown content={message.content} />
+                    <div className="space-y-1">
+                      <Markdown content={message.content} />
+                      <div className="flex items-center gap-1 pt-1">
+                        <ReadAloudButton text={message.content} />
+                      </div>
+                    </div>
                   ) : (
                     <span className="inline-block animate-pulse text-sm text-muted-foreground">
                       Kero is thinking…
@@ -310,16 +319,27 @@ export function ChatView({
 
       <div className="border-t border-border bg-background/80 backdrop-blur">
         <div className="mx-auto w-full max-w-3xl px-4 py-4">
-          <div className="mb-2 flex items-center justify-end gap-2">
-            {streaming ? (
-              <Button variant="outline" size="sm" onClick={handleStop}>
-                <Square className="size-3.5" /> Stop
-              </Button>
-            ) : canRegenerate ? (
-              <Button variant="ghost" size="sm" onClick={handleRegenerate}>
-                <RefreshCw className="size-3.5" /> Regenerate
-              </Button>
-            ) : null}
+          <div className="mb-2 flex items-center justify-between gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setVoiceModalOpen(true)}
+              disabled={streaming}
+              className="gap-1.5 border-primary/30 text-xs font-medium hover:border-primary hover:bg-primary/5"
+            >
+              <Mic className="size-3.5 text-primary" /> Live Voice Chat
+            </Button>
+            <div className="flex items-center gap-2">
+              {streaming ? (
+                <Button variant="outline" size="sm" onClick={handleStop}>
+                  <Square className="size-3.5" /> Stop
+                </Button>
+              ) : canRegenerate ? (
+                <Button variant="ghost" size="sm" onClick={handleRegenerate}>
+                  <RefreshCw className="size-3.5" /> Regenerate
+                </Button>
+              ) : null}
+            </div>
           </div>
           <div className="relative rounded-2xl border border-border bg-card p-2 shadow-sm focus-within:border-primary/60">
             <Textarea
@@ -333,28 +353,60 @@ export function ChatView({
                   void handleSend();
                 }
               }}
-              placeholder="Message Kero…"
+              placeholder="Message Kero or record voice note…"
               rows={1}
               className={cn(
-                "max-h-48 min-h-11 resize-none border-0 bg-transparent pr-12 text-sm shadow-none",
+                "max-h-48 min-h-11 resize-none border-0 bg-transparent pr-20 text-sm shadow-none",
                 "focus-visible:ring-0",
               )}
             />
-            <Button
-              size="icon"
-              className="absolute bottom-3 right-3 size-8 rounded-full"
-              disabled={!input.trim() || streaming}
-              onClick={() => void handleSend()}
-              aria-label="Send message"
-            >
-              <ArrowUp className="size-4" />
-            </Button>
+            <div className="absolute bottom-2.5 right-2.5 flex items-center gap-1">
+              <AudioNoteRecorder
+                disabled={streaming || pending}
+                onTranscribed={(text) => {
+                  setInput((prev) => (prev ? `${prev} ${text}` : text));
+                  inputRef.current?.focus();
+                }}
+              />
+              <Button
+                size="icon"
+                className="size-8 rounded-full"
+                disabled={!input.trim() || streaming}
+                onClick={() => void handleSend()}
+                aria-label="Send message"
+              >
+                <ArrowUp className="size-4" />
+              </Button>
+            </div>
           </div>
           <p className="mt-2 text-center text-xs text-muted-foreground">
             Kero can make mistakes. Check important information.
           </p>
         </div>
       </div>
+
+      <LiveVoiceModal
+        open={voiceModalOpen}
+        onOpenChange={setVoiceModalOpen}
+        conversationId={conversationId}
+        recentMessages={messages}
+        onMessageAdded={(userText, assistantReply) => {
+          const userMsg: UiMessage = {
+            id: `user-${Date.now()}`,
+            role: "user",
+            content: userText,
+          };
+          const assistantMsg: UiMessage = {
+            id: `asst-${Date.now() + 1}`,
+            role: "assistant",
+            content: assistantReply,
+          };
+          setMessages((prev) => [...prev, userMsg, assistantMsg]);
+          void save({ data: { conversationId, role: "user", content: userText } });
+          void save({ data: { conversationId, role: "assistant", content: assistantReply } });
+          onConversationChanged();
+        }}
+      />
     </div>
   );
 }

@@ -2,9 +2,11 @@
 
 import type { AiProvider } from "../types";
 import { nvidiaProvider } from "./nvidia.server";
+import { geminiProvider } from "./gemini.server";
 
 const providers: Record<string, AiProvider> = {
   [nvidiaProvider.id]: nvidiaProvider,
+  [geminiProvider.id]: geminiProvider,
 };
 
 export const DEFAULT_PROVIDER_ID = nvidiaProvider.id;

@@ -11,6 +11,7 @@ interface WaValue {
     timestamp?: string;
     type?: string;
     text?: { body?: string };
+    audio?: { id?: string; mime_type?: string; voice?: boolean };
   }[];
   statuses?: {
     id?: string;
@@ -247,14 +248,19 @@ async function handleInbound(admin: Admin, value: WaValue) {
     if (!number.auto_reply) continue;
     if (!text) {
       const { detectConversationSignals } = await import("@/lib/ai/kinyarwanda/retrieval.server");
+      const isVoice = message.type === "audio" || Boolean(message.audio);
       const isKinyarwanda = detectConversationSignals([
         { role: "user", content: message.type ?? "" },
       ]).kinyarwanda;
       await sendWhatsAppText(
         from,
-        isKinyarwanda
-          ? "Ubu nakira gusa ubutumwa bwanditse kuri WhatsApp."
-          : "I can only read text messages for now.",
+        isVoice
+          ? isKinyarwanda
+            ? "Urakoze! Kuri ubu ubutumwa bwa amajwi (audio note) buraboneka muri Kero Web App ikoresheje Gemini Live. Kuri WhatsApp nyamuneka nyandikira ubutumwa bwanditse, ndagusubiza ako kanya!"
+            : "Thank you! Voice notes and live audio are available directly in the Kero Web App using Gemini Live. On WhatsApp, please type your message as text and I will gladly reply!"
+          : isKinyarwanda
+            ? "Ubu nakira gusa ubutumwa bwanditse kuri WhatsApp."
+            : "I can only read text messages for now.",
       );
       continue;
     }

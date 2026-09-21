@@ -39,13 +39,18 @@ export const Route = createFileRoute("/api/chat")({
 
         const { getProvider } = await import("@/lib/ai/providers/registry.server");
         const { buildMessages } = await import("@/lib/ai/prompt.server");
-        const provider = getProvider();
+        const { isGeminiConfigured } = await import("@/lib/ai/gemini.server");
+        const { geminiProvider } = await import("@/lib/ai/providers/gemini.server");
 
-        if (!provider.describe().configured) {
+        const nvidia = getProvider("nvidia");
+        const hasNvidia = nvidia.describe().configured;
+        const hasGemini = isGeminiConfigured();
+
+        if (!hasNvidia && !hasGemini) {
           return errorResponse(
             503,
             "missing_api_key",
-            "Kero is not connected to NVIDIA yet. Add the NVIDIA_API_KEY secret to enable replies.",
+            "Kero requires an API key to answer. Please configure NVIDIA_API_KEY or GEMINI_API_KEY in settings.",
           );
         }
 
@@ -53,6 +58,7 @@ export const Route = createFileRoute("/api/chat")({
           await import("@/lib/ai/providers/nvidia.server");
         const { retrieveKinyarwandaContext, detectConversationSignals } =
           await import("@/lib/ai/kinyarwanda/retrieval.server");
+
         // A deployment can be pinned (via NVIDIA_MODEL) to a model NVIDIA has
         // retired — that answers 404/410. Try the known-good models in order.
         const candidates = [
@@ -63,29 +69,52 @@ export const Route = createFileRoute("/api/chat")({
         const signals = detectConversationSignals(parsed.messages);
         const retrieved = retrieveKinyarwandaContext(parsed.messages, 5);
         const kinyarwandaDirective = signals.kinyarwanda
-          ? "\n[IMPORTANT LINGUISTIC DIRECTIVE]: The user is speaking Kinyarwanda. Reply strictly in authentic, natural Rwandan Kinyarwanda. Use real everyday words ('Ni meza', 'Nta kibazo', 'Meze neza', 'Urakoze nawe', 'Sawa sawa', 'Turi kumwe', 'Kabisa', 'Rwose'). NEVER use 'Urakaza neza' to answer 'Urakoze'. Keep greetings and casual chat brief (1-2 sentences) and warm, without robotic customer support closing questions."
+          ? signals.business
+            ? "\n[IMPORTANT LINGUISTIC DIRECTIVE - BUSINESS KINYARWANDA]: The user is communicating in a business, corporate, or customer service context in Kinyarwanda. Use accurate, formal terminology (e.g., 'Umukiriya', 'Sosiyete/Ikigo', 'Ubufatanye', 'Inama', 'Amasezerano', 'Inyemezabwishyu', 'Ubwishyu', 'Igiciro/Ibiciro', 'Konti', 'Ijambobanga', 'Kode yo kwemeza', 'Sisitemu/Urubuga'). Maintain a helpful, respectful, and professional tone ('Murakoze', 'Mumeze mute?'). Never use 'Urakaza neza' to answer 'Murakoze/Urakoze'."
+            : "\n[IMPORTANT LINGUISTIC DIRECTIVE - NATURAL KINYARWANDA]: The user is speaking Kinyarwanda. Reply strictly in authentic, natural Rwandan Kinyarwanda. Use real everyday words ('Ni meza', 'Nta kibazo', 'Meze neza', 'Urakoze nawe', 'Sawa sawa', 'Turi kumwe', 'Kabisa', 'Rwose'). NEVER use 'Urakaza neza' to answer 'Urakoze'. Keep greetings and casual chat brief (1-2 sentences) and warm, without robotic customer support closing questions."
           : "";
         const contextHint = `\nConversation signals: ${JSON.stringify(signals)}${kinyarwandaDirective}${retrieved ? `\nLanguage reference:\n${retrieved}` : ""}`;
         const messages = buildMessages(parsed.messages, 30, contextHint);
+
         let upstream: Response | undefined;
-        for (const model of candidates) {
-          try {
-            upstream = await provider.streamChat({ messages, model, signal: request.signal });
-          } catch (error) {
-            console.error("[chat] upstream request failed", error);
-            return errorResponse(
-              502,
-              "upstream_unreachable",
-              "Could not reach the NVIDIA service.",
-            );
+
+        // Try NVIDIA primary if configured
+        if (hasNvidia) {
+          for (const model of candidates) {
+            try {
+              upstream = await nvidia.streamChat({ messages, model, signal: request.signal });
+            } catch (error) {
+              console.warn("[chat] NVIDIA stream request attempt failed", error);
+              break;
+            }
+            if (upstream.ok && upstream.body) break;
+            if (upstream.status !== 404 && upstream.status !== 410) break;
+            console.warn(`[chat] model unavailable (${upstream.status}): ${model}`);
+            await upstream.text().catch(() => "");
           }
-          if (upstream.ok && upstream.body) break;
-          if (upstream.status !== 404 && upstream.status !== 410) break;
-          console.error(`[chat] model unavailable (${upstream.status}): ${model}`);
-          await upstream.text().catch(() => "");
         }
+
+        // If NVIDIA failed, rate-limited, rejected key, or wasn't configured, fallback immediately to Gemini!
+        const nvidiaFailed = !upstream || !upstream.ok || !upstream.body;
+        if (nvidiaFailed && hasGemini) {
+          console.info(
+            "[chat] NVIDIA failed or unavailable, falling back seamlessly to Google Gemini",
+          );
+          try {
+            const geminiRes = await geminiProvider.streamChat({
+              messages,
+              signal: request.signal,
+            });
+            if (geminiRes.ok && geminiRes.body) {
+              return geminiRes;
+            }
+          } catch (geminiError) {
+            console.error("[chat] Gemini fallback also failed", geminiError);
+          }
+        }
+
         if (!upstream) {
-          return errorResponse(502, "upstream_unreachable", "Could not reach the NVIDIA service.");
+          return errorResponse(502, "upstream_unreachable", "Could not reach the AI service.");
         }
 
         if (!upstream.ok || !upstream.body) {
@@ -93,12 +122,12 @@ export const Route = createFileRoute("/api/chat")({
           console.error("[chat] upstream error", upstream.status, detail);
           const message =
             upstream.status === 401 || upstream.status === 403
-              ? "The NVIDIA API key was rejected. Check the key and try again."
+              ? "The NVIDIA API key was rejected. Check the key or configure GEMINI_API_KEY as fallback."
               : upstream.status === 429
                 ? "NVIDIA is rate limiting requests. Please retry in a moment."
                 : upstream.status === 404 || upstream.status === 410
-                  ? "The configured AI model is no longer available from NVIDIA. Update the model setting and try again."
-                  : `NVIDIA returned an error (${upstream.status}).`;
+                  ? "The configured AI model is no longer available from NVIDIA. Update the model setting or configure GEMINI_API_KEY as fallback."
+                  : `AI service returned an error (${upstream.status}).`;
           return errorResponse(upstream.status === 429 ? 429 : 502, "upstream_error", message);
         }
 

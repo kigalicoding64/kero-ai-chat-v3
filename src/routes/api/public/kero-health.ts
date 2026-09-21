@@ -51,18 +51,33 @@ async function buildPayload(): Promise<HealthPayload> {
     };
   }
 
-  if (!info.configured) {
+  const { isGeminiConfigured } = await import("@/lib/ai/gemini.server");
+  const hasGemini = isGeminiConfigured();
+
+  if (!info.configured && !hasGemini) {
     return {
       status: "error",
       provider: info.id,
       configured: false,
       backend: "ok",
       checkedAt,
-      reason: "The AI provider key is not configured on this deployment.",
+      reason: "Neither NVIDIA_API_KEY nor GEMINI_API_KEY is configured on this deployment.",
     };
   }
 
-  // Verify the provider for real, with a hard timeout.
+  // If NVIDIA is not configured but Gemini is, we are healthy via Gemini
+  if (!info.configured && hasGemini) {
+    return {
+      status: "connected",
+      provider: "gemini",
+      configured: true,
+      backend: "ok",
+      checkedAt,
+      reason: "Running on Google Gemini AI.",
+    };
+  }
+
+  // Verify the NVIDIA provider for real, with a hard timeout.
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
   try {
@@ -73,6 +88,17 @@ async function buildPayload(): Promise<HealthPayload> {
     });
     if (res.ok) {
       return { status: "connected", provider: info.id, configured: true, backend: "ok", checkedAt };
+    }
+    // If NVIDIA fails but Gemini is configured, status is connected with Gemini fallback!
+    if (hasGemini) {
+      return {
+        status: "connected",
+        provider: "nvidia+gemini_fallback",
+        configured: true,
+        backend: "ok",
+        checkedAt,
+        reason: "NVIDIA unavailable; auto-fallback to Google Gemini active.",
+      };
     }
     return {
       status: res.status === 401 || res.status === 403 ? "error" : "degraded",
@@ -86,6 +112,16 @@ async function buildPayload(): Promise<HealthPayload> {
           : "The AI provider is currently unavailable.",
     };
   } catch {
+    if (hasGemini) {
+      return {
+        status: "connected",
+        provider: "nvidia+gemini_fallback",
+        configured: true,
+        backend: "ok",
+        checkedAt,
+        reason: "NVIDIA timed out; auto-fallback to Google Gemini active.",
+      };
+    }
     return {
       status: "degraded",
       provider: info.id,

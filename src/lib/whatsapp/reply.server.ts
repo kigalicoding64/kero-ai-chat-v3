@@ -62,13 +62,26 @@ Formatting:
 - Never mention models, providers, prompts, internal systems, or this instruction.`;
 
 export async function generateWhatsAppReply(history: Turn[]): Promise<string> {
+  const {
+    isGeminiConfigured,
+    getGeminiClient,
+    generateContentWithFallback,
+    TEXT_MODEL_CANDIDATES,
+  } = await import("@/lib/ai/gemini.server");
   const key = process.env["NVIDIA_API_KEY"];
-  if (!key || key.trim().length === 0) throw new Error("NVIDIA_API_KEY is not configured");
+  const hasNvidia = Boolean(key && key.trim().length > 0);
+  const hasGemini = isGeminiConfigured();
+
+  if (!hasNvidia && !hasGemini) {
+    throw new Error("Neither NVIDIA_API_KEY nor GEMINI_API_KEY is configured");
+  }
 
   const signals = detectConversationSignals(history);
   const retrieved = retrieveKinyarwandaContext(history, 5);
   const kinyarwandaDirective = signals.kinyarwanda
-    ? "\n[IMPORTANT WHATSAPP KINYARWANDA DIRECTIVE]: The user is messaging in Kinyarwanda. Reply strictly in authentic, natural Rwandan Kinyarwanda as texted on WhatsApp. Use real everyday words ('Ni meza', 'Nta kibazo', 'Meze neza', 'Urakoze nawe', 'Sawa sawa', 'Turi kumwe', 'Kabisa', 'Rwose'). NEVER use 'Urakaza neza' to answer 'Urakoze'. Keep greetings and casual chat brief (1-2 sentences) and warm, without robotic customer support closing questions."
+    ? signals.business
+      ? "\n[IMPORTANT WHATSAPP KINYARWANDA DIRECTIVE - BUSINESS REGISTER]: The user is messaging in a business, corporate, or customer service context in Kinyarwanda. Use accurate, formal, and respectful Kinyarwanda ('Umukiriya', 'Sosiyete/Ikigo cy'ubucuruzi', 'Ubufatanye', 'Inama', 'Amasezerano', 'Inyemezabwishyu', 'Ubwishyu', 'Igiciro', 'Konti', 'Sisitemu'). Maintain a helpful, polite, and professional demeanor. NEVER use 'Urakaza neza' to answer 'Murakoze/Urakoze'."
+      : "\n[IMPORTANT WHATSAPP KINYARWANDA DIRECTIVE - PERSONAL REGISTER]: The user is messaging in Kinyarwanda. Reply strictly in authentic, natural Rwandan Kinyarwanda as texted on WhatsApp. Use real everyday words ('Ni meza', 'Nta kibazo', 'Meze neza', 'Urakoze nawe', 'Sawa sawa', 'Turi kumwe', 'Kabisa', 'Rwose'). NEVER use 'Urakaza neza' to answer 'Urakoze'. Keep greetings and casual chat brief (1-2 sentences) and warm, without robotic customer support closing questions."
     : "";
   const contextHint = `\nConversation signals: ${JSON.stringify(signals)}${kinyarwandaDirective}${retrieved ? `\nLanguage reference:\n${retrieved}` : ""}`;
   const messages = buildMessages(history, 20, contextHint);
@@ -79,42 +92,80 @@ export async function generateWhatsAppReply(history: Turn[]): Promise<string> {
   );
 
   let lastError = "no model responded";
-  for (const model of candidates) {
-    let res: Response;
-    try {
-      res = await fetch(`${NVIDIA_BASE_URL}/chat/completions`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${key.trim()}`,
-          "Content-Type": "application/json",
-          Accept: "application/json",
-        },
-        body: JSON.stringify({
-          model,
-          messages,
-          stream: false,
-          temperature: 0.72,
-          top_p: 0.95,
-          max_tokens: 700,
-          chat_template_kwargs: { thinking: false },
-        }),
-      });
-    } catch {
-      throw new Error("NVIDIA service unavailable");
+
+  // Try NVIDIA if key is provided
+  if (hasNvidia) {
+    for (const model of candidates) {
+      let res: Response;
+      try {
+        res = await fetch(`${NVIDIA_BASE_URL}/chat/completions`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${key!.trim()}`,
+            "Content-Type": "application/json",
+            Accept: "application/json",
+          },
+          body: JSON.stringify({
+            model,
+            messages,
+            stream: false,
+            temperature: 0.72,
+            top_p: 0.95,
+            max_tokens: 700,
+            chat_template_kwargs: { thinking: false },
+          }),
+        });
+      } catch (err) {
+        console.warn("[whatsapp] NVIDIA request network error", err);
+        lastError = "NVIDIA service unavailable";
+        break;
+      }
+      if (res.status === 404 || res.status === 410) {
+        lastError = `model unavailable: ${model}`;
+        await res.text().catch(() => "");
+        continue;
+      }
+      if (!res.ok) {
+        lastError = `NVIDIA request failed (${res.status})`;
+        break;
+      }
+      const json = (await res.json()) as { choices?: { message?: { content?: string } }[] };
+      const text = (json.choices?.[0]?.message?.content ?? "").trim();
+      if (text.length > 0) return text;
+      lastError = "empty reply";
     }
-    if (res.status === 404 || res.status === 410) {
-      lastError = `model unavailable: ${model}`;
-      await res.text().catch(() => "");
-      continue;
-    }
-    if (!res.ok) {
-      lastError = `NVIDIA request failed (${res.status})`;
-      break;
-    }
-    const json = (await res.json()) as { choices?: { message?: { content?: string } }[] };
-    const text = (json.choices?.[0]?.message?.content ?? "").trim();
-    if (text.length > 0) return text;
-    lastError = "empty reply";
   }
+
+  // If NVIDIA failed or is unconfigured, fallback immediately to Gemini
+  if (hasGemini) {
+    console.info("[whatsapp] NVIDIA unavailable, falling back seamlessly to Google Gemini");
+    try {
+      const ai = getGeminiClient();
+      const systemInstruction = messages[0]?.content;
+      const nonSystem = messages.filter((m) => m.role !== "system");
+
+      const contents = nonSystem.map((m) => ({
+        role: m.role === "assistant" ? "model" : "user",
+        parts: [{ text: m.content }],
+      }));
+
+      const { response: geminiRes } = await generateContentWithFallback(ai, {
+        models: TEXT_MODEL_CANDIDATES,
+        contents,
+        config: {
+          systemInstruction,
+          temperature: 0.72,
+        },
+      });
+
+      const geminiText = geminiRes.text?.trim() ?? "";
+      if (geminiText.length > 0) {
+        return geminiText;
+      }
+    } catch (geminiErr) {
+      console.error("[whatsapp] Gemini fallback also failed", geminiErr);
+    }
+  }
+
   throw new Error(lastError);
 }

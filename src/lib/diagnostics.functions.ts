@@ -21,15 +21,53 @@ export const runConnectionTest = createServerFn({ method: "POST" })
 
     checks.push({
       id: "api_key",
-      label: "API key configured",
+      label: "NVIDIA API key configured",
       status: info.configured ? "pass" : "fail",
       detail: info.configured
         ? "NVIDIA_API_KEY is present in the server environment."
         : "NVIDIA_API_KEY is missing. Add it as a secret, then republish the app.",
     });
 
-    if (!info.configured) {
+    const { isGeminiConfigured, getGeminiClient } = await import("@/lib/ai/gemini.server");
+    const geminiActive = isGeminiConfigured();
+    checks.push({
+      id: "gemini_fallback",
+      label: "Google Gemini auto-fallback",
+      status: geminiActive ? "pass" : "warn",
+      detail: geminiActive
+        ? "GEMINI_API_KEY is configured. If NVIDIA fails or times out, Kero will automatically answer with Gemini."
+        : "GEMINI_API_KEY is not configured. Add GEMINI_API_KEY as a backup secret so Kero never goes down if NVIDIA fails.",
+    });
+
+    if (!info.configured && !geminiActive) {
       return { provider: info.id, model: info.model, checks, ok: false };
+    }
+
+    if (!info.configured && geminiActive) {
+      try {
+        const ai = getGeminiClient();
+        const testRes = await ai.models.generateContent({
+          model: "gemini-3.8-flash",
+          contents: "Reply with exactly: KERO GEMINI OK",
+        });
+        checks.push({
+          id: "gemini_completion",
+          label: "Gemini fallback live test",
+          status: "pass",
+          detail: `Gemini active & responding: "${(testRes.text ?? "").slice(0, 100)}"`,
+        });
+      } catch (geminiTestErr) {
+        checks.push({
+          id: "gemini_completion",
+          label: "Gemini fallback live test",
+          status: "fail",
+          detail:
+            geminiTestErr instanceof Error
+              ? geminiTestErr.message.slice(0, 300)
+              : "Gemini test failed",
+        });
+      }
+      return { provider: "gemini", model: "gemini-3.8-flash", checks, ok: true };
     }
 
     // 2. Reachability + model list
